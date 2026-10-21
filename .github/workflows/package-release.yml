@@ -205,9 +205,6 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with:
-          # The publish step pushes a tag, so the remote has to be writable.
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Fetch the staged trees
         uses: actions/download-artifact@v7
@@ -315,16 +312,17 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          git tag -f "$TAG"
-          git push -f origin "refs/tags/$TAG"
-          # Forced re-runs land on an existing release, so creation is
-          # conditional and uploads clobber.
+          # No local git here: this job runs in a container where the checkout is
+          # not owned by the current user, and git refuses to operate on it
+          # ("dubious ownership"). `gh release create --target` creates the tag
+          # server-side at the commit that built these packages, which is the
+          # same guarantee without shelling out to git.
           if ! gh release view "$TAG" --repo "$PACKAGING_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$TAG" \
               --repo "$PACKAGING_REPOSITORY" \
               --title "zed-i18n $TAG (Arch Linux)" \
               --notes "Arch Linux packages for upstream zed-i18n $TAG." \
-              --verify-tag
+              --target "$GITHUB_SHA"
           fi
           # Explicit names rather than a glob: a stray debug package must not
           # reach the release just because it matched.
