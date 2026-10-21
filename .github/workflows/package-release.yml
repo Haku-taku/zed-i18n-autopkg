@@ -236,6 +236,10 @@ jobs:
         run: |
           set -euo pipefail
           useradd -m builder
+          # SRCDEST must be writable by the user running makepkg: the trees were
+          # extracted as root by the artifact download, and makepkg refuses to
+          # build against a directory it cannot write to.
+          chown -R builder: dist
           for arch in x86_64 aarch64; do
             mkdir -p "build/$arch"
             cp dist/PKGBUILD "build/$arch/"
