@@ -1,18 +1,24 @@
 name: Package upstream release
 
 # Watches LI-NA/zed-i18n for a published release and turns its Linux tarballs
-# into installable Arch packages in one pass: download, restage into the FHS
-# layout the official Arch package installs, build both architectures with
-# makepkg, publish the packages.
+# into installable Arch packages: download, restage into the FHS layout the
+# official Arch package installs, build both architectures with makepkg, publish
+# the packages.
 #
 # This repository never merges upstream source. Upstream already builds the
 # editor; the only thing this repo owns is the Arch staging step, so an upstream
 # release is consumed as assets and there is nothing to conflict with.
 #
 # The release carries the built packages and nothing else. The staging trees and
-# the PKGBUILD are intermediate: they exist only inside the run that produces
-# the packages, which is why the PKGBUILD's digests never have to agree with a
-# previously published tree.
+# the PKGBUILD are workflow artifacts: they live in the run that produces the
+# packages, never as a published asset a later run downloads back.
+#
+# Staging and makepkg are separate jobs because they need opposite environments.
+# Staging runs the bundled Zed binary to capture shell completions, which needs
+# wayland, xkbcommon and the rest of Zed's runtime libraries -- present on the
+# ubuntu runner, absent from the minimal archlinux image, where the binary exits
+# without producing completions. makepkg needs Arch, so the trees cross the
+# boundary as an artifact.
 
 on:
   schedule:
@@ -92,34 +98,16 @@ jobs:
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-  build:
-    name: Package ${{ needs.detect.outputs.tag }}
+  stage:
+    name: Stage ${{ needs.detect.outputs.tag }}
     needs: detect
     if: ${{ needs.detect.outputs.needed == 'true' }}
     runs-on: ubuntu-24.04
-    # GitHub has no Arch Linux runner, so makepkg comes from the official image.
-    # It is x86_64 only, which is enough for both packages: package() copies a
-    # prebuilt tree and compiles nothing, so the aarch64 package is the same
-    # file copy under CARCH=aarch64 --ignorearch. No cross toolchain and no arm
-    # runner are involved, because there is no architecture for a compiler to
-    # mismatch.
-    container:
-      image: archlinux/archlinux:latest
-      options: --privileged
     env:
       TAG: ${{ needs.detect.outputs.tag }}
     steps:
-      - name: Install tooling
-        run: |
-          set -euo pipefail
-          pacman -Syu --noconfirm --needed \
-            base-devel python git github-cli zstd libarchive
-
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with:
-          # The publish step pushes a tag, so the remote has to be writable.
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Verify the staging layout is still the official Arch one
         run: |
@@ -145,8 +133,8 @@ jobs:
       - name: Restage the trees and render the PKGBUILD
         run: |
           set -euo pipefail
-          # The staging step runs the bundled CLI to capture shell completions,
-          # so the machine must match one of the downloaded architectures.
+          # This is the step that needs Zed's runtime libraries: it executes the
+          # bundled CLI to capture completions for all three shells.
           python3 scripts/package_release.py \
             --dist-dir dist \
             --release-tag "$TAG" \
@@ -178,17 +166,66 @@ jobs:
           print("PKGBUILD digests match the staged trees")
           PY
 
+      - name: Upload the staging trees for makepkg
+        uses: actions/upload-artifact@v7
+        with:
+          name: arch-staging
+          path: |
+            dist/PKGBUILD
+            dist/zed-i18n-linux-x86_64-pkgdir.tar.gz
+            dist/zed-i18n-linux-aarch64-pkgdir.tar.gz
+          if-no-files-found: error
+          # The trees are already gzip streams; compressing again in the
+          # artifact store buys nothing and costs time.
+          compression-level: 0
+
+  build:
+    name: Build packages for ${{ needs.detect.outputs.tag }}
+    needs:
+      - detect
+      - stage
+    runs-on: ubuntu-24.04
+    # GitHub has no Arch Linux runner, so makepkg comes from the official image.
+    # It is x86_64 only, which is enough for both packages: package() copies a
+    # prebuilt tree and compiles nothing, so the aarch64 package is the same
+    # file copy under CARCH=aarch64 --ignorearch. No cross toolchain and no arm
+    # runner are involved, because there is no architecture for a compiler to
+    # mismatch.
+    container:
+      image: archlinux/archlinux:latest
+      options: --privileged
+    env:
+      TAG: ${{ needs.detect.outputs.tag }}
+    steps:
+      - name: Install makepkg
+        run: |
+          set -euo pipefail
+          pacman -Syu --noconfirm --needed \
+            base-devel git github-cli zstd libarchive
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          # The publish step pushes a tag, so the remote has to be writable.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch the staged trees
+        uses: actions/download-artifact@v7
+        with:
+          name: arch-staging
+          path: dist
+
       - name: Configure makepkg
         run: |
           set -euo pipefail
-          # SRCDEST makes makepkg consume the trees this run just staged
-          # instead of fetching them back from a release URL. The digests in the
-          # PKGBUILD are still verified, so this is a source location, not a
-          # trust bypass.
+          # SRCDEST points makepkg at the trees this run staged, so it builds
+          # from them instead of fetching the same bytes back over the network.
+          # The PKGBUILD's sha256sums are still verified against those files.
           #
-          # The image's OPTIONS enable `debug`, which splits out a zed-i18n-debug
-          # package built from symbols a prebuilt upstream binary does not have;
-          # `!strip` keeps makepkg from rewriting a payload it did not compile.
+          # The image's OPTIONS enable `debug`, which splits out a
+          # zed-i18n-debug package built from symbols a prebuilt upstream binary
+          # does not have; `!strip` keeps makepkg from rewriting a payload it
+          # did not compile.
           cp /etc/makepkg.conf /work-makepkg.conf
           sed -i 's/^OPTIONS=.*/OPTIONS=(!strip docs !libtool !staticlibs emptydirs zipman purge !debug !lto)/' \
             /work-makepkg.conf

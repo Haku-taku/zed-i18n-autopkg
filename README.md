@@ -12,21 +12,17 @@ prebuilt Linux tarballs attached.
 
 So nothing here compiles, and nothing here tracks upstream *source*. The workflow watches
 upstream **releases**, takes the two Linux tarballs, relocates the bundle into the FHS
-layout the official Arch `zed` package installs, and publishes:
-
-- `zed-i18n-linux-x86_64-pkgdir.tar.gz`
-- `zed-i18n-linux-aarch64-pkgdir.tar.gz`
-- `PKGBUILD` — with `pkgver`, `_i18nrev`, `url` and both `sha256sums` rendered from the
-  trees beside it
+layout the official Arch `zed` package installs, renders a `PKGBUILD` whose digests
+describe those trees, and builds them with `makepkg`.
 
 The release is the deliverable, and it carries only the built packages:
 
 - `zed-i18n-<pkgver>-1-x86_64.pkg.tar.zst`
 - `zed-i18n-<pkgver>-1-aarch64.pkg.tar.zst`
 
-The staging trees and the rendered `PKGBUILD` are intermediate. They exist only inside the
-run that builds the packages, so a package is never assembled by downloading an artifact
-this repository published earlier. Nothing is pushed to the AUR.
+The staging trees and the rendered `PKGBUILD` are intermediate: they pass from the
+`stage` job to the `build` job as a workflow artifact, so a package is never assembled by
+downloading something this repository published earlier. Nothing is pushed to the AUR.
 
 The consequence worth stating plainly: **there is no upstream branch to merge.** A
 release is consumed as assets, so a change upstream cannot conflict with anything here.
@@ -51,12 +47,26 @@ gh release download v<zed-version>-i18n.<rev> -p '*.pkg.tar.zst'
 sudo pacman -U zed-i18n-*.pkg.tar.zst
 ```
 
+## Why staging and building are separate jobs
+
+They need opposite environments, and the first attempt to merge them failed on exactly
+that:
+
+- **Staging** executes the bundled Zed binary (`--completions bash|zsh|fish`) to capture
+  the completion scripts, which are not in the upstream tarball. That needs wayland,
+  xkbcommon, vulkan and the rest of Zed's runtime libraries — present on the ubuntu
+  runner, absent from the minimal `archlinux` image, where the binary exits 1 without
+  printing anything.
+- **makepkg** needs Arch, and only exists there.
+
+The trees therefore cross the boundary as a workflow artifact. That is not a published
+asset: it lives in the run and is discarded with it.
+
 ## How the packages are built without an Arch runner
 
-GitHub has no Arch Linux runner. The single `build` job uses the official
-`archlinux/archlinux` container, which is x86_64 only — and that is sufficient for both
-architectures, because `package()` in this PKGBUILD copies a prebuilt tree and compiles
-nothing:
+The `build` job uses the official `archlinux/archlinux` container, which is x86_64 only —
+and that is sufficient for both architectures, because `package()` in this PKGBUILD copies
+a prebuilt tree and compiles nothing:
 
 | target | how |
 |---|---|
