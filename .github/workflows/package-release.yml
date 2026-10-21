@@ -28,6 +28,11 @@ on:
         required: false
         type: boolean
         default: false
+      force:
+        description: "Repackage even when this tag already has a release (re-runs are idempotent)"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: package-release
@@ -73,7 +78,14 @@ jobs:
             exit 1
           fi
           echo "Newest upstream release: $tag"
-          if gh release view "$tag" --repo "$PACKAGING_REPOSITORY" >/dev/null 2>&1; then
+          # A release here is the marker that this tag was packaged. `force`
+          # exists because that marker says nothing about *which* assets were
+          # produced: adding a job that emits new ones has to be able to re-run
+          # a tag that already shipped.
+          if [[ "${{ inputs.force }}" == "true" ]]; then
+            echo "Force requested; repackaging $tag."
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          elif gh release view "$tag" --repo "$PACKAGING_REPOSITORY" >/dev/null 2>&1; then
             echo "needed=false" >> "$GITHUB_OUTPUT"
           else
             echo "needed=true" >> "$GITHUB_OUTPUT"
@@ -164,18 +176,23 @@ jobs:
           set -euo pipefail
           # Same tag as upstream, so `_tag="v$pkgver-i18n.$_i18nrev"` in the
           # PKGBUILD resolves here.
-          git tag "$TAG"
-          git push origin "refs/tags/$TAG"
-          gh release create "$TAG" \
-            --repo "$PACKAGING_REPOSITORY" \
-            --title "zed-i18n $TAG (Arch Linux packaging)" \
-            --notes "Arch staging trees and rendered PKGBUILD for upstream $TAG." \
-            --verify-tag
+          git tag -f "$TAG"
+          git push -f origin "refs/tags/$TAG"
+          # Forced re-runs land on an existing release, so creation is
+          # conditional and uploads clobber.
+          if ! gh release view "$TAG" --repo "$PACKAGING_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "$PACKAGING_REPOSITORY" \
+              --title "zed-i18n $TAG (Arch Linux packaging)" \
+              --notes "Arch staging trees, rendered PKGBUILD and Arch packages for upstream $TAG." \
+              --verify-tag
+          fi
           gh release upload "$TAG" \
             --repo "$PACKAGING_REPOSITORY" \
             dist/zed-i18n-linux-x86_64-pkgdir.tar.gz \
             dist/zed-i18n-linux-aarch64-pkgdir.tar.gz \
-            dist/PKGBUILD
+            dist/PKGBUILD \
+            --clobber
 
       - name: Summarize a dry run
         if: ${{ inputs.dry_run == true }}
@@ -185,3 +202,118 @@ jobs:
           echo "Dry run: staged $TAG; nothing was published." >> "$GITHUB_STEP_SUMMARY"
           ls -l dist >> "$GITHUB_STEP_SUMMARY"
 
+
+  makepkg:
+    name: Build .pkg.tar.zst packages
+    needs:
+      - detect
+      - package
+    # GitHub has no Arch Linux runner, so makepkg comes from the official image.
+    # It is x86_64 only, which is enough for both packages: package() only
+    # copies the staged tree, so the aarch64 package is the same file copy under
+    # CARCH=aarch64 --ignorearch. Nothing is compiled, so no cross toolchain and
+    # no arm runner are involved.
+    if: ${{ inputs.dry_run != true }}
+    runs-on: ubuntu-24.04
+    container:
+      image: archlinux/archlinux:latest
+      options: --privileged
+    env:
+      TAG: ${{ needs.detect.outputs.tag }}
+    steps:
+      - name: Install makepkg
+        run: |
+          set -euo pipefail
+          pacman -Syu --noconfirm --needed base-devel git github-cli zstd libarchive
+
+      - name: Fetch the rendered PKGBUILD
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The published copy, not the template: its sha256sums describe the
+          # trees beside it, and it is the file this job is meant to prove
+          # buildable.
+          mkdir -p /work
+          gh release download "$TAG" --repo "$PACKAGING_REPOSITORY" \
+            --dir /work --pattern 'PKGBUILD'
+          cat /work/PKGBUILD | head -20
+
+      - name: Build both architectures
+        run: |
+          set -euo pipefail
+          useradd -m builder
+          chown -R builder: /work
+          for arch in x86_64 aarch64; do
+            mkdir -p "/work/$arch"
+            cp /work/PKGBUILD "/work/$arch/"
+            chown -R builder: "/work/$arch"
+            # --nodeps: the runtime dependencies are the package's contract with
+            # the system, not something this container has to satisfy.
+            # --nocheck: the PKGBUILD has no check() function.
+            # --ignorearch: only for aarch64, where the host is not the target.
+            # `[[ ]] && extra+=(...)` would return 1 for x86_64 and take the
+            # whole step down under `set -e`; the if-block keeps the status 0.
+            extra=()
+            if [[ "$arch" == aarch64 ]]; then
+              extra+=(--ignorearch)
+            fi
+            runuser -u builder -- env CARCH="$arch" HOME=/home/builder \
+              bash -c "cd /work/$arch && makepkg -f --nodeps --nocheck ${extra[*]}"
+          done
+
+      - name: Verify the packages
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for arch in x86_64 aarch64; do
+            pkg=(/work/$arch/*.pkg.tar.zst)
+            if [ ${#pkg[@]} -ne 1 ]; then
+              echo "expected one package for $arch, found ${#pkg[@]}" >&2
+              exit 1
+            fi
+            # pacman parsing the archive is the check that the metadata is
+            # well-formed, not merely present. LC_ALL=C keeps the field labels
+            # parseable: pacman translates them, so the container's locale would
+            # otherwise decide whether the grep below matches.
+            LC_ALL=C pacman -Qip "${pkg[0]}"
+            recorded="$(LC_ALL=C pacman -Qip "${pkg[0]}" | awk -F': ' '/^Architecture/ {print $2}')"
+            if [[ "$recorded" != "$arch" ]]; then
+              echo "package records architecture '$recorded', expected '$arch'" >&2
+              exit 1
+            fi
+            # The installed payload must be the staged tree, not the bundle.
+            if ! bsdtar -tf "${pkg[0]}" | grep -qx 'usr/bin/zeditor'; then
+              echo "package does not install usr/bin/zeditor" >&2
+              exit 1
+            fi
+            if bsdtar -tf "${pkg[0]}" | grep -q '^usr/lib/lib.*\.so$'; then
+              echo "package ships bundled shared libraries" >&2
+              exit 1
+            fi
+          done
+
+      - name: Upload the packages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" \
+            --repo "$PACKAGING_REPOSITORY" \
+            /work/x86_64/*.pkg.tar.zst \
+            /work/aarch64/*.pkg.tar.zst \
+            --clobber
+
+      - name: Summarize
+        run: |
+          set -euo pipefail
+          {
+            echo "### Packages for $TAG"
+            echo
+            echo '```'
+            for arch in x86_64 aarch64; do
+              LC_ALL=C pacman -Qip /work/$arch/*.pkg.tar.zst \
+                | grep -E '^(Name|Version|Architecture|Installed Size|Compressed Size)'
+            done
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

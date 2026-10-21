@@ -19,8 +19,13 @@ layout the official Arch `zed` package installs, and publishes:
 - `PKGBUILD` — with `pkgver`, `_i18nrev`, `url` and both `sha256sums` rendered from the
   trees beside it
 
-The release is the deliverable. Nothing is pushed to the AUR: take `PKGBUILD` from the
-release and build with `makepkg` wherever you package.
+The release is the deliverable. It carries the staging trees, the rendered `PKGBUILD`,
+and the built packages:
+
+- `zed-i18n-<pkgver>-1-x86_64.pkg.tar.zst`
+- `zed-i18n-<pkgver>-1-aarch64.pkg.tar.zst`
+
+Nothing is pushed to the AUR.
 
 The consequence worth stating plainly: **there is no upstream branch to merge.** A
 release is consumed as assets, so a change upstream cannot conflict with anything here.
@@ -33,6 +38,7 @@ releases and to publish its own.
 ```bash
 gh workflow run package-release.yml -f dry_run=true   # stage without publishing
 gh workflow run package-release.yml                   # package the newest upstream release
+gh workflow run package-release.yml -f force=true     # repackage an existing tag
 ```
 
 It then runs hourly on its own. An upstream release is packaged within the hour.
@@ -40,12 +46,31 @@ It then runs hourly on its own. An upstream release is packaged within the hour.
 ## Installing the result
 
 ```bash
+gh release download v<zed-version>-i18n.<rev> -p '*.pkg.tar.zst'
+sudo pacman -U zed-i18n-*.pkg.tar.zst
+```
+
+Or build it yourself from the same release, which is what the workflow does:
+
+```bash
 gh release download v<zed-version>-i18n.<rev> -p PKGBUILD
 makepkg -si
 ```
 
-`makepkg` reads `source_x86_64` / `source_aarch64` from the rendered PKGBUILD, which point
-back at the release assets, so no `.SRCINFO` and no AUR step is involved.
+## How the packages are built without an Arch runner
+
+GitHub has no Arch Linux runner. The `makepkg` job uses the official
+`archlinux/archlinux` container, which is x86_64 only — and that is sufficient for both
+architectures, because `package()` in this PKGBUILD copies a prebuilt tree and compiles
+nothing:
+
+| target | how |
+|---|---|
+| `x86_64` | `makepkg` on the container's own architecture |
+| `aarch64` | `CARCH=aarch64 makepkg --ignorearch` — same file copy, metadata records aarch64 |
+
+No cross toolchain and no arm runner are involved, because there is no compilation step
+for an architecture to mismatch.
 
 ## What is vendored
 
