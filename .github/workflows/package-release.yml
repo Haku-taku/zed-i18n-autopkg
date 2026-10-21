@@ -1,21 +1,23 @@
 name: Package upstream release
 
-# Watches LI-NA/zed-i18n for a published release, repackages its Linux tarballs
-# into the FHS layout the official Arch package installs, and publishes those
-# trees here with a PKGBUILD whose digests are rendered from them.
+# Watches LI-NA/zed-i18n for a published release and turns its Linux tarballs
+# into installable Arch packages in one pass: download, restage into the FHS
+# layout the official Arch package installs, build both architectures with
+# makepkg, publish the packages.
 #
 # This repository never merges upstream source. Upstream already builds the
 # editor; the only thing this repo owns is the Arch staging step, so an upstream
 # release is consumed as assets and there is nothing to conflict with.
 #
-# The release is the deliverable. Nothing is pushed to the AUR: take the
-# rendered PKGBUILD from the release and build with makepkg wherever you
-# package.
+# The release carries the built packages and nothing else. The staging trees and
+# the PKGBUILD are intermediate: they exist only inside the run that produces
+# the packages, which is why the PKGBUILD's digests never have to agree with a
+# previously published tree.
 
 on:
   schedule:
-    # Upstream releases every few days. Hourly detection keeps the packaged
-    # output within an hour of a release at negligible cost.
+    # Upstream releases every few days. Hourly detection keeps the packages
+    # within an hour of a release at negligible cost.
     - cron: "23 * * * *"
   workflow_dispatch:
     inputs:
@@ -24,12 +26,12 @@ on:
         required: false
         default: ""
       dry_run:
-        description: "Build and verify, but publish no release assets"
+        description: "Build and verify, but publish nothing"
         required: false
         type: boolean
         default: false
       force:
-        description: "Repackage even when this tag already has a release (re-runs are idempotent)"
+        description: "Rebuild even when this tag already has a release"
         required: false
         type: boolean
         default: false
@@ -43,8 +45,6 @@ permissions:
 
 env:
   UPSTREAM_REPOSITORY: LI-NA/zed-i18n
-  # The staging trees are published as release assets of this repository, and
-  # the PKGBUILD's `url` points here, so keep them equal.
   PACKAGING_REPOSITORY: ${{ github.repository }}
 
 jobs:
@@ -80,8 +80,8 @@ jobs:
           echo "Newest upstream release: $tag"
           # A release here is the marker that this tag was packaged. `force`
           # exists because that marker says nothing about *which* assets were
-          # produced: adding a job that emits new ones has to be able to re-run
-          # a tag that already shipped.
+          # produced: changing how they are built has to be able to re-run a tag
+          # that already shipped.
           if [[ "${{ inputs.force }}" == "true" ]]; then
             echo "Force requested; repackaging $tag."
             echo "needed=true" >> "$GITHUB_OUTPUT"
@@ -92,20 +92,34 @@ jobs:
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-  package:
-    name: Stage ${{ needs.detect.outputs.tag }}
+  build:
+    name: Package ${{ needs.detect.outputs.tag }}
     needs: detect
     if: ${{ needs.detect.outputs.needed == 'true' }}
     runs-on: ubuntu-24.04
+    # GitHub has no Arch Linux runner, so makepkg comes from the official image.
+    # It is x86_64 only, which is enough for both packages: package() copies a
+    # prebuilt tree and compiles nothing, so the aarch64 package is the same
+    # file copy under CARCH=aarch64 --ignorearch. No cross toolchain and no arm
+    # runner are involved, because there is no architecture for a compiler to
+    # mismatch.
+    container:
+      image: archlinux/archlinux:latest
+      options: --privileged
+    env:
+      TAG: ${{ needs.detect.outputs.tag }}
     steps:
+      - name: Install tooling
+        run: |
+          set -euo pipefail
+          pacman -Syu --noconfirm --needed \
+            base-devel python git github-cli zstd libarchive
+
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          # A tag push at the end needs history and a writable remote.
+          # The publish step pushes a tag, so the remote has to be writable.
           token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
 
       - name: Verify the staging layout is still the official Arch one
         run: |
@@ -117,7 +131,6 @@ jobs:
       - name: Download the upstream Linux tarballs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.detect.outputs.tag }}
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -129,14 +142,12 @@ jobs:
             --pattern 'zed-i18n-linux-aarch64.tar.gz'
           ls -l dist
 
-      - name: Stage the Arch trees and render the PKGBUILD
-        env:
-          TAG: ${{ needs.detect.outputs.tag }}
+      - name: Restage the trees and render the PKGBUILD
         run: |
           set -euo pipefail
           # The staging step runs the bundled CLI to capture shell completions,
-          # so the runner must match one of the downloaded architectures.
-          uv run --no-project python scripts/package_release.py \
+          # so the machine must match one of the downloaded architectures.
+          python3 scripts/package_release.py \
             --dist-dir dist \
             --release-tag "$TAG" \
             --repository "$PACKAGING_REPOSITORY"
@@ -145,7 +156,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import hashlib, re, sys
+          import hashlib, sys
           from pathlib import Path
 
           dist = Path("dist")
@@ -167,87 +178,31 @@ jobs:
           print("PKGBUILD digests match the staged trees")
           PY
 
-      - name: Publish the release assets
-        if: ${{ inputs.dry_run != true }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.detect.outputs.tag }}
+      - name: Configure makepkg
         run: |
           set -euo pipefail
-          # Same tag as upstream, so `_tag="v$pkgver-i18n.$_i18nrev"` in the
-          # PKGBUILD resolves here.
-          git tag -f "$TAG"
-          git push -f origin "refs/tags/$TAG"
-          # Forced re-runs land on an existing release, so creation is
-          # conditional and uploads clobber.
-          if ! gh release view "$TAG" --repo "$PACKAGING_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$TAG" \
-              --repo "$PACKAGING_REPOSITORY" \
-              --title "zed-i18n $TAG (Arch Linux packaging)" \
-              --notes "Arch staging trees, rendered PKGBUILD and Arch packages for upstream $TAG." \
-              --verify-tag
-          fi
-          gh release upload "$TAG" \
-            --repo "$PACKAGING_REPOSITORY" \
-            dist/zed-i18n-linux-x86_64-pkgdir.tar.gz \
-            dist/zed-i18n-linux-aarch64-pkgdir.tar.gz \
-            dist/PKGBUILD \
-            --clobber
-
-      - name: Summarize a dry run
-        if: ${{ inputs.dry_run == true }}
-        env:
-          TAG: ${{ needs.detect.outputs.tag }}
-        run: |
-          echo "Dry run: staged $TAG; nothing was published." >> "$GITHUB_STEP_SUMMARY"
-          ls -l dist >> "$GITHUB_STEP_SUMMARY"
-
-
-  makepkg:
-    name: Build .pkg.tar.zst packages
-    needs:
-      - detect
-      - package
-    # GitHub has no Arch Linux runner, so makepkg comes from the official image.
-    # It is x86_64 only, which is enough for both packages: package() only
-    # copies the staged tree, so the aarch64 package is the same file copy under
-    # CARCH=aarch64 --ignorearch. Nothing is compiled, so no cross toolchain and
-    # no arm runner are involved.
-    if: ${{ inputs.dry_run != true }}
-    runs-on: ubuntu-24.04
-    container:
-      image: archlinux/archlinux:latest
-      options: --privileged
-    env:
-      TAG: ${{ needs.detect.outputs.tag }}
-    steps:
-      - name: Install makepkg
-        run: |
-          set -euo pipefail
-          pacman -Syu --noconfirm --needed base-devel git github-cli zstd libarchive
-
-      - name: Fetch the rendered PKGBUILD
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          # The published copy, not the template: its sha256sums describe the
-          # trees beside it, and it is the file this job is meant to prove
-          # buildable.
-          mkdir -p /work
-          gh release download "$TAG" --repo "$PACKAGING_REPOSITORY" \
-            --dir /work --pattern 'PKGBUILD'
-          cat /work/PKGBUILD | head -20
+          # SRCDEST makes makepkg consume the trees this run just staged
+          # instead of fetching them back from a release URL. The digests in the
+          # PKGBUILD are still verified, so this is a source location, not a
+          # trust bypass.
+          #
+          # The image's OPTIONS enable `debug`, which splits out a zed-i18n-debug
+          # package built from symbols a prebuilt upstream binary does not have;
+          # `!strip` keeps makepkg from rewriting a payload it did not compile.
+          cp /etc/makepkg.conf /work-makepkg.conf
+          sed -i 's/^OPTIONS=.*/OPTIONS=(!strip docs !libtool !staticlibs emptydirs zipman purge !debug !lto)/' \
+            /work-makepkg.conf
+          printf 'SRCDEST=%s\n' "$PWD/dist" >> /work-makepkg.conf
+          grep -E '^(OPTIONS|SRCDEST)=' /work-makepkg.conf
 
       - name: Build both architectures
         run: |
           set -euo pipefail
           useradd -m builder
-          chown -R builder: /work
           for arch in x86_64 aarch64; do
-            mkdir -p "/work/$arch"
-            cp /work/PKGBUILD "/work/$arch/"
-            chown -R builder: "/work/$arch"
+            mkdir -p "build/$arch"
+            cp dist/PKGBUILD "build/$arch/"
+            chown -R builder: "build/$arch"
             # --nodeps: the runtime dependencies are the package's contract with
             # the system, not something this container has to satisfy.
             # --nocheck: the PKGBUILD has no check() function.
@@ -259,7 +214,8 @@ jobs:
               extra+=(--ignorearch)
             fi
             runuser -u builder -- env CARCH="$arch" HOME=/home/builder \
-              bash -c "cd /work/$arch && makepkg -f --nodeps --nocheck ${extra[*]}"
+              bash -c "cd '$PWD/build/$arch' && makepkg -f --nodeps --nocheck \
+                --config /work-makepkg.conf ${extra[*]}"
           done
 
       - name: Verify the packages
@@ -267,7 +223,15 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           for arch in x86_64 aarch64; do
-            pkg=(/work/$arch/*.pkg.tar.zst)
+            # A debug package here means the OPTIONS override regressed; it is
+            # not something to silently drop, because it also means makepkg
+            # stripped a payload it did not build.
+            debug=(build/$arch/zed-i18n-debug-*.pkg.tar.zst)
+            if [ ${#debug[@]} -ne 0 ]; then
+              echo "makepkg produced a debug package for $arch" >&2
+              exit 1
+            fi
+            pkg=(build/$arch/zed-i18n-[0-9]*.pkg.tar.zst)
             if [ ${#pkg[@]} -ne 1 ]; then
               echo "expected one package for $arch, found ${#pkg[@]}" >&2
               exit 1
@@ -275,7 +239,7 @@ jobs:
             # pacman parsing the archive is the check that the metadata is
             # well-formed, not merely present. LC_ALL=C keeps the field labels
             # parseable: pacman translates them, so the container's locale would
-            # otherwise decide whether the grep below matches.
+            # otherwise decide whether the awk below matches.
             LC_ALL=C pacman -Qip "${pkg[0]}"
             recorded="$(LC_ALL=C pacman -Qip "${pkg[0]}" | awk -F': ' '/^Architecture/ {print $2}')"
             if [[ "$recorded" != "$arch" ]]; then
@@ -291,29 +255,62 @@ jobs:
               echo "package ships bundled shared libraries" >&2
               exit 1
             fi
+            # Completions exist only because staging generated them, so a
+            # package that lost them would still install.
+            for completion in \
+              usr/share/bash-completion/completions/zeditor \
+              usr/share/fish/vendor_completions.d/zeditor.fish \
+              usr/share/zsh/site-functions/_zeditor; do
+              if ! bsdtar -tf "${pkg[0]}" | grep -qx "$completion"; then
+                echo "package is missing $completion" >&2
+                exit 1
+              fi
+            done
           done
 
-      - name: Upload the packages
+      - name: Publish the packages
+        if: ${{ inputs.dry_run != true }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          git tag -f "$TAG"
+          git push -f origin "refs/tags/$TAG"
+          # Forced re-runs land on an existing release, so creation is
+          # conditional and uploads clobber.
+          if ! gh release view "$TAG" --repo "$PACKAGING_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "$PACKAGING_REPOSITORY" \
+              --title "zed-i18n $TAG (Arch Linux)" \
+              --notes "Arch Linux packages for upstream zed-i18n $TAG." \
+              --verify-tag
+          fi
+          # Explicit names rather than a glob: a stray debug package must not
+          # reach the release just because it matched.
           gh release upload "$TAG" \
             --repo "$PACKAGING_REPOSITORY" \
-            /work/x86_64/*.pkg.tar.zst \
-            /work/aarch64/*.pkg.tar.zst \
+            build/x86_64/zed-i18n-[0-9]*.pkg.tar.zst \
+            build/aarch64/zed-i18n-[0-9]*.pkg.tar.zst \
             --clobber
 
       - name: Summarize
+        if: ${{ always() }}
         run: |
-          set -euo pipefail
           {
-            echo "### Packages for $TAG"
+            echo "### $TAG"
             echo
+            if [ "${{ inputs.dry_run }}" = "true" ]; then
+              echo "Dry run: nothing was published."
+              echo
+            fi
             echo '```'
+            shopt -s nullglob
             for arch in x86_64 aarch64; do
-              LC_ALL=C pacman -Qip /work/$arch/*.pkg.tar.zst \
-                | grep -E '^(Name|Version|Architecture|Installed Size|Compressed Size)'
+              for pkg in build/$arch/zed-i18n-[0-9]*.pkg.tar.zst; do
+                LC_ALL=C pacman -Qip "$pkg" \
+                  | grep -E '^(Name|Version|Architecture|Installed Size|Compressed Size)'
+                echo
+              done
             done
             echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          } >> "$GITHUB_STEP_SUMMARY" || true

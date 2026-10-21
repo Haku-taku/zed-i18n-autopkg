@@ -19,13 +19,14 @@ layout the official Arch `zed` package installs, and publishes:
 - `PKGBUILD` — with `pkgver`, `_i18nrev`, `url` and both `sha256sums` rendered from the
   trees beside it
 
-The release is the deliverable. It carries the staging trees, the rendered `PKGBUILD`,
-and the built packages:
+The release is the deliverable, and it carries only the built packages:
 
 - `zed-i18n-<pkgver>-1-x86_64.pkg.tar.zst`
 - `zed-i18n-<pkgver>-1-aarch64.pkg.tar.zst`
 
-Nothing is pushed to the AUR.
+The staging trees and the rendered `PKGBUILD` are intermediate. They exist only inside the
+run that builds the packages, so a package is never assembled by downloading an artifact
+this repository published earlier. Nothing is pushed to the AUR.
 
 The consequence worth stating plainly: **there is no upstream branch to merge.** A
 release is consumed as assets, so a change upstream cannot conflict with anything here.
@@ -50,16 +51,9 @@ gh release download v<zed-version>-i18n.<rev> -p '*.pkg.tar.zst'
 sudo pacman -U zed-i18n-*.pkg.tar.zst
 ```
 
-Or build it yourself from the same release, which is what the workflow does:
-
-```bash
-gh release download v<zed-version>-i18n.<rev> -p PKGBUILD
-makepkg -si
-```
-
 ## How the packages are built without an Arch runner
 
-GitHub has no Arch Linux runner. The `makepkg` job uses the official
+GitHub has no Arch Linux runner. The single `build` job uses the official
 `archlinux/archlinux` container, which is x86_64 only — and that is sufficient for both
 architectures, because `package()` in this PKGBUILD copies a prebuilt tree and compiles
 nothing:
@@ -71,6 +65,15 @@ nothing:
 
 No cross toolchain and no arm runner are involved, because there is no compilation step
 for an architecture to mismatch.
+
+`SRCDEST` in the container's `makepkg.conf` points at the directory this run staged, so
+`makepkg` reads the trees locally instead of fetching them back from a URL. The PKGBUILD's
+`sha256sums` are still checked against those files.
+
+The container's `makepkg.conf` also enables `debug`, which splits out a `zed-i18n-debug`
+package built from symbols a prebuilt binary does not carry. The job overrides `OPTIONS`
+to `!debug` and `!strip`, so `makepkg` neither emits that package nor rewrites a payload
+it did not compile.
 
 ## What is vendored
 
