@@ -1,0 +1,187 @@
+name: Package upstream release
+
+# Watches LI-NA/zed-i18n for a published release, repackages its Linux tarballs
+# into the FHS layout the official Arch package installs, and publishes those
+# trees here with a PKGBUILD whose digests are rendered from them.
+#
+# This repository never merges upstream source. Upstream already builds the
+# editor; the only thing this repo owns is the Arch staging step, so an upstream
+# release is consumed as assets and there is nothing to conflict with.
+#
+# The release is the deliverable. Nothing is pushed to the AUR: take the
+# rendered PKGBUILD from the release and build with makepkg wherever you
+# package.
+
+on:
+  schedule:
+    # Upstream releases every few days. Hourly detection keeps the packaged
+    # output within an hour of a release at negligible cost.
+    - cron: "23 * * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream release tag to package (default: newest published release)"
+        required: false
+        default: ""
+      dry_run:
+        description: "Build and verify, but publish no release assets"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: package-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPOSITORY: LI-NA/zed-i18n
+  # The staging trees are published as release assets of this repository, and
+  # the PKGBUILD's `url` points here, so keep them equal.
+  PACKAGING_REPOSITORY: ${{ github.repository }}
+
+jobs:
+  detect:
+    name: Find an un-packaged upstream release
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      needed: ${{ steps.pick.outputs.needed }}
+    steps:
+      - name: Pick the newest upstream release this repository has not packaged
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$INPUT_TAG" ]]; then
+            tag="$INPUT_TAG"
+          else
+            # Releases, not tags: an upstream tag exists before its assets do,
+            # and a package cannot be built from a release that has not
+            # finished uploading.
+            tag="$(gh api "repos/$UPSTREAM_REPOSITORY/releases?per_page=20" \
+              --jq '[.[] | select(.draft == false and .prerelease == false) | .tag_name]
+                    | map(select(test("^v[0-9.]+-i18n\\.[0-9]+$")))
+                    | first // empty')"
+          fi
+          if [[ -z "$tag" ]]; then
+            echo "No published upstream release found." >&2
+            exit 1
+          fi
+          echo "Newest upstream release: $tag"
+          if gh release view "$tag" --repo "$PACKAGING_REPOSITORY" >/dev/null 2>&1; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  package:
+    name: Stage ${{ needs.detect.outputs.tag }}
+    needs: detect
+    if: ${{ needs.detect.outputs.needed == 'true' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          # A tag push at the end needs history and a writable remote.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+
+      - name: Verify the staging layout is still the official Arch one
+        run: |
+          # Runs against a synthetic bundle: staging never reads the payload,
+          # only member names, so this guards the package's file contract
+          # without downloading a release first.
+          python3 -m unittest tests.test_layout -v
+
+      - name: Download the upstream Linux tarballs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.detect.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # Only the universal Linux tarballs are needed: completions are
+          # generated from the x86_64 one and both arches carry every locale.
+          gh release download "$TAG" --repo "$UPSTREAM_REPOSITORY" \
+            --dir dist \
+            --pattern 'zed-i18n-linux-x86_64.tar.gz' \
+            --pattern 'zed-i18n-linux-aarch64.tar.gz'
+          ls -l dist
+
+      - name: Stage the Arch trees and render the PKGBUILD
+        env:
+          TAG: ${{ needs.detect.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # The staging step runs the bundled CLI to capture shell completions,
+          # so the runner must match one of the downloaded architectures.
+          uv run --no-project python scripts/package_release.py \
+            --dist-dir dist \
+            --release-tag "$TAG" \
+            --repository "$PACKAGING_REPOSITORY"
+
+      - name: Verify the rendered PKGBUILD against the trees beside it
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, re, sys
+          from pathlib import Path
+
+          dist = Path("dist")
+          text = (dist / "PKGBUILD").read_text(encoding="utf-8")
+          ok = True
+          for arch in ("x86_64", "aarch64"):
+              tree = dist / f"zed-i18n-linux-{arch}-pkgdir.tar.gz"
+              digest = hashlib.sha256(tree.read_bytes()).hexdigest()
+              line = f"sha256sums_{arch}=('{digest}')"
+              if line not in text:
+                  print(f"PKGBUILD does not carry {line}", file=sys.stderr)
+                  ok = False
+              # The zeros in the template are a tripwire, not a placeholder.
+              if "0" * 64 in text:
+                  print("PKGBUILD still carries a zero digest", file=sys.stderr)
+                  ok = False
+          if not ok:
+              raise SystemExit(1)
+          print("PKGBUILD digests match the staged trees")
+          PY
+
+      - name: Publish the release assets
+        if: ${{ inputs.dry_run != true }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.detect.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Same tag as upstream, so `_tag="v$pkgver-i18n.$_i18nrev"` in the
+          # PKGBUILD resolves here.
+          git tag "$TAG"
+          git push origin "refs/tags/$TAG"
+          gh release create "$TAG" \
+            --repo "$PACKAGING_REPOSITORY" \
+            --title "zed-i18n $TAG (Arch Linux packaging)" \
+            --notes "Arch staging trees and rendered PKGBUILD for upstream $TAG." \
+            --verify-tag
+          gh release upload "$TAG" \
+            --repo "$PACKAGING_REPOSITORY" \
+            dist/zed-i18n-linux-x86_64-pkgdir.tar.gz \
+            dist/zed-i18n-linux-aarch64-pkgdir.tar.gz \
+            dist/PKGBUILD
+
+      - name: Summarize a dry run
+        if: ${{ inputs.dry_run == true }}
+        env:
+          TAG: ${{ needs.detect.outputs.tag }}
+        run: |
+          echo "Dry run: staged $TAG; nothing was published." >> "$GITHUB_STEP_SUMMARY"
+          ls -l dist >> "$GITHUB_STEP_SUMMARY"
+
